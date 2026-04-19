@@ -549,7 +549,7 @@ void skills100pts() {
 	pros::c::task_notify(auto_midscore_task); // pause task
 
 	//move to center goal
-	/*chassis.moveToPose(23,2,75, 1500,{.lead=0.2,.maxSpeed=80,.minSpeed=60,.earlyExitRange=1});
+	chassis.moveToPose(23,2,75, 1500,{.lead=0.2,.maxSpeed=80,.minSpeed=60,.earlyExitRange=1});
 	chassis.waitUntilDone();
 
 	pros::c::delay(300);
@@ -581,7 +581,8 @@ void skills100pts() {
 	chassis.moveToPoint(-32, 30, 800,{.maxSpeed=90,.minSpeed=90,.earlyExitRange=2});//17,7
 	pros::c::delay(500);
 	simple_intaking(600,200,200);
-	chassis.moveToPoint(-39, 30, 900,{.maxSpeed=70,.minSpeed=20,.earlyExitRange=0.5});
+	//chassis.moveToPoint(-39, 30, 900,{.maxSpeed=70,.minSpeed=20,.earlyExitRange=0.5});
+	chassis.moveToPoint(-32, 30, 800,{.maxSpeed=70,.minSpeed=20,.earlyExitRange=0.5});
 	loader.set_value(true);	
 	chassis.waitUntilDone();
 
@@ -695,14 +696,14 @@ void skills100pts() {
 	pros::delay(1000);
 	chassis.waitUntilDone();
 	pros::c::task_notify(auto_highscore_task); // pause task
-*/
-pros::c::task_notify(auto_intake_task); // debug
+
+//pros::c::task_notify(auto_intake_task); // debug
 	simple_intaking(0,200,200);
 	
 
 
-		chassis.setPose(0,0,0);//debug	
-		pros::delay(1000);//debug
+		//chassis.setPose(0,0,0);//debug	
+		//pros::delay(1000);//debug
 
 	//score low goal
 
