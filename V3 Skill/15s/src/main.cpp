@@ -1,0 +1,1099 @@
+#include "main.h"
+#include "lemlib/chassis/chassis.hpp"
+#include "lemlib/util.hpp"
+#include "liblvgl/llemu.hpp"
+#include "pros/abstract_motor.hpp"
+#include "pros/llemu.hpp"
+#include "pros/misc.h"
+#include "pros/misc.hpp"
+#include "pros/motors.h"
+#include "pros/optical.h"
+#include "pros/rtos.h"
+#include "pros/rtos.hpp"
+#include "lemlib/api.hpp"
+#include "pros/screen.h"
+#include "pros/screen.hpp"
+#include "robot-config.h"
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <atomic>
+#include <sys/types.h>
+#include "cmath"
+
+#include "pros/screen.hpp"
+#include "lemlib/timer.hpp"
+#include "pros/imu.hpp"
+
+ASSET(curve_txt);
+
+std::string color;
+std::string current_color;
+
+// THIS IS THE 15 SECOND MAIN FILE
+
+// int selected_auton = 0;
+
+// const int AUTON_COUNT = 4;
+
+
+bool field_connection = false;
+bool auton_choosed = false;
+bool manual_auton_run=false;
+float auton_time;
+bool auton_started=false;
+
+
+// Auton Selector
+int CurrentAuton = 0;
+const int NumberOfAutons = 5; // The number of Autons in this program, If you need more change this number add a name and add a function
+const char* Autons[] = {
+    "Solo14         ",
+    "L_3+4     ",
+    "R_4+3     ",
+    "LL_7         ",
+	"RR_7         "
+};
+
+ 
+void AutonIncrease(){
+    CurrentAuton ++;
+    if(CurrentAuton > (NumberOfAutons-1)){
+        CurrentAuton = 0;
+    }
+}
+
+void AutonDecrease(){
+    CurrentAuton --;
+    if(CurrentAuton < 0){
+        CurrentAuton = NumberOfAutons - 1;
+    }
+}
+
+void calibrate(){
+    chassis.setPose(0,0,0);
+	verticalEnc.set_position(0);
+	horizontalEnc.set_position(0);
+
+}
+
+
+
+
+
+
+
+
+void get_allience_color(){
+	
+	float hue = optical_top.get_hue();
+	if (((hue >= 0 && hue <= 30) || (hue >= 330 && hue <= 360))&&optical_top.get_proximity() >= 200) {
+		color = "Red";
+		optical_top.set_led_pwm(0);
+	} 
+	else if (hue >= 170 && hue <= 230 && optical_top.get_proximity() >= 200) {
+		color = "Blue";
+		optical_top.set_led_pwm(0);
+	}
+	else {
+		color = "Unknow";
+		optical_top.set_led_pwm(0);
+	}
+	
+}
+
+
+
+
+// std::string get_sort_color() {
+//     float hue = optical_sort.get_hue();
+//     if ((hue >= 0 && hue <= 30) || (hue >= 350 && hue <= 360)) {
+//         return "Red";
+//     } else if ((hue >= 215 && hue <= 225)) {
+//         return "Blue";
+//     } else {
+//         return "Unknown";
+//     }
+// }
+
+
+
+
+
+
+void intakecoast(){
+
+	intakeF.set_brake_mode(pros::MotorBrake::coast);
+	intakeM.set_brake_mode(pros::MotorBrake::brake);
+	intakeB.set_brake_mode(pros::MotorBrake::brake);	
+}
+
+
+
+bool reverse_complete=false;
+bool low_complete=false;
+bool mid_complete=false;
+static int upper_ball_counter = 0;
+static int mid_ball_counter = 0;
+
+bool is_preloading_active = false; 
+bool is_highscoring = false; 
+
+lemlib::Timer reverse_timer(150); // 用于 150ms 的反转排料
+lemlib::Timer unjam_timer(100);   // 用于 100ms 的防堵转退球 (比 50ms 更有效)
+lemlib::Timer highscore_timer(500);
+bool is_reversing = false;
+bool is_unjamming = false;
+
+
+bool is_intake_jammed() {
+    static lemlib::Timer jam_timer_M(100);
+    // 条件：电流 > 2000mA 且 实际速度 < 目标速度的 10%
+    bool high_current = intakeM.get_current_draw() > 2200;
+    bool low_velocity = std::abs(intakeM.get_actual_velocity()) < 10;
+
+    if (!(high_current && low_velocity)) {
+        jam_timer_M.reset();
+        return false;
+    }
+    return jam_timer_M.isDone();
+}
+
+bool is_intakeF_jammed() {
+    static lemlib::Timer jam_timer_F(150);
+    // 条件：电流 > 2000mA 且 实际速度 < 目标速度的 10%
+    bool high_current_F = intakeF.get_current_draw() > 2300;
+    bool low_velocity_F = std::abs(intakeF.get_actual_velocity()) < 10;
+
+    if (!(high_current_F && low_velocity_F)) {
+        jam_timer_F.reset();
+        return false;
+    }
+    return jam_timer_F.isDone();
+}
+
+bool is_ball_ready_org(){
+	return (optical_top.get_proximity() >= 200);
+}
+
+bool is_ball_preload(){
+	return (dis_preload.get_distance() <= 100);
+}
+
+
+
+
+bool is_ball_ready(bool counter=true) {
+if(counter){
+    // 判断当前是否检测到球
+    if (optical_top.get_proximity() >= 200) {
+        // 检测到球，增加计数
+        upper_ball_counter++;
+ 
+        // 达到稳定次数后一直返回true
+        if (upper_ball_counter >= 10) {
+            return true;
+        }
+    } else {
+        // 没检测到球，计数设为0
+        if (upper_ball_counter > 0) {
+            upper_ball_counter = 0;
+        }
+    }
+    return false;
+	} else {
+		return (optical_top.get_proximity() >= 200);
+	}
+}
+
+
+
+bool is_mid_full(float dis) {
+
+    // 判断当前是否检测到球
+    if (dis_roller.get_distance() <= dis) {
+        // 检测到球，增加计数
+        mid_ball_counter++;
+ 
+        // 达到稳定次数后一直返回true
+        if (mid_ball_counter >= 20) {
+            return true;
+        }
+    } else {
+        // 没检测到球，计数设为0
+        if (mid_ball_counter > 0) {
+            mid_ball_counter = 0;
+        }
+    }
+    return false;
+	
+}
+
+
+
+void intaking(int velocity_front, int velocity_back, float back_dec = 1) {
+    bool ball_at_entrance = is_ball_preload(); 
+    bool ball_at_top = is_ball_ready();      
+    bool is_jammed = is_intake_jammed();
+    bool mid_full = is_mid_full(50);
+
+    int target_m = 0;
+    int target_b = 0;
+
+    if (ball_at_entrance && !ball_at_top) {
+        is_preloading_active = true; 
+    }
+    if (ball_at_top) {
+        is_preloading_active = false;
+    }
+
+    if (is_preloading_active) {
+        // 优先级 1:只要搬运状态开启，无论其他传感器如何
+        target_m = velocity_back;
+        target_b = velocity_back * 0.8; 
+        optical_top.set_led_pwm(100);
+
+    }
+    else if (ball_at_top) {
+        // 优先级 2: 顶部已就位
+        // 进入此分支说明顶部已经有球
+        if (mid_full) {
+            // 只有顶部满了，且中部也满了，才彻底停止
+            target_m = 0;
+            target_b = 0;
+        } else {
+            // 顶部满了但中部没满，中马达继续转动尝试吸入
+            target_m = velocity_back;
+            target_b = 0; 
+        }
+        optical_top.set_led_pwm(0); // 顶部球到位后关灯/低功耗
+        
+        // 堵转保护
+        if (is_jammed) { target_m = -velocity_back; }
+
+    } 
+    else {
+        // 优先级 3: 正常巡航/空载
+        // 此时既没在搬运，顶部也没球
+        optical_top.set_led_pwm(100);
+        target_m = velocity_back;
+        target_b = velocity_back * back_dec;
+    }
+
+    intakeF.move_velocity(velocity_front);
+    intakeM.move_velocity(target_m);
+    intakeB.move_velocity(target_b);
+}
+
+void intaking_reverse(int v_front, int v_back) {
+    bool is_jammed = is_intake_jammed();
+	bool is_jammedF = is_intakeF_jammed();
+    int target_f = v_front;
+    int target_m = v_back;
+    int target_b = -v_back;
+
+
+    if (!(is_jammed || is_jammedF)) {
+        target_f = v_front;
+        target_m = v_back;
+        target_b = v_back*0.3; 
+    } else {
+        target_f = -v_front*0.5;
+        target_m = -v_back*0.5;       
+        target_b = v_back*0.3; 
+    }
+    intakeF.move_velocity(target_f);
+    intakeM.move_velocity(target_m);
+    intakeB.move_velocity(target_b);
+}
+
+
+
+void highscoring(int velocity_front, int velocity_mid, int velocity_back) {
+    // 1. 触发计时状态
+    // 当检测到球，并且当前没有在进行 highscore 动作时，重置计时器并打上标记
+    if (is_ball_preload() && !is_highscoring) {
+        highscore_timer.reset();
+        is_highscoring = true;
+    }
+    // 2. 结束计时状态
+    // 如果 500ms 时间到了，或者球提前离开了，结束该状态
+    if (is_highscoring && (highscore_timer.isDone() || !is_ball_preload())) {
+        is_highscoring = false;
+    }
+    // 3. 计算目标速度
+    int target_f = 0;
+    int target_m = 0;
+    int target_b = 0;
+
+    if (is_highscoring) {
+        // 正在执行 Highscore 500ms 准备动作 ---
+        target_f = -200; 
+        target_m = -velocity_mid * 0.3;
+        target_b = velocity_back ;
+    } 
+    else {
+        if (is_intake_jammed() || is_intakeF_jammed()) {
+            target_f = -velocity_front;
+            target_m = -velocity_mid;
+            target_b = velocity_back;
+        } else {
+            target_f = velocity_front;
+            target_m = velocity_mid;
+            target_b = velocity_back;
+        }
+    }
+    intakeF.move_velocity(target_f);
+    intakeM.move_velocity(target_m);
+    intakeB.move_velocity(target_b);
+}
+
+
+
+void midscoring(int velocity_front, int velocity_back) { 
+
+
+    optical_top.set_led_pwm(100);
+    // 获取传感器的读数
+
+    int dist = dis_preload.get_distance(); 
+
+    // 目标速度预设
+    int target_f = 0;
+    int target_m = 0;
+    int target_b = 0;
+
+    // 触发反转
+    if (is_ball_ready(false) && !reverse_complete && !is_reversing) {
+        reverse_timer.reset();
+        is_reversing = true;
+    }
+    // 触发防堵转 (一旦堵转，强制退球 150ms，防止抽搐)
+    if ((is_intakeF_jammed() || is_intake_jammed())&& !is_unjamming) {
+        unjam_timer.reset();
+        is_unjamming = true;
+    }
+
+    // ================= [状态机执行] =================
+    if (is_reversing) {
+        // --- 状态 A: 执行 200ms 爆发反转 ---
+        if (!reverse_timer.isDone()) {
+            target_f = -300; 
+            target_m = -100;
+            target_b = velocity_back;
+        } else {
+            is_reversing = false;
+            reverse_complete = true; // 动作结束，打上完成标记
+        }
+    } 
+
+    else if (is_unjamming) {
+        // --- 状态 C: 正在处理堵转 (执行 150ms) ---
+        if (!unjam_timer.isDone()) {
+            target_f = -velocity_front; // 强制反转吐出
+            target_m = -abs(velocity_back);
+            target_b = velocity_back;
+        } else {
+            is_unjamming = false; // 退球结束，准备恢复正常
+        }
+    } 
+    else {
+        // --- 状态 D: 正常巡航/吸取阶段 ---
+        target_f = velocity_front;
+        target_m = abs(velocity_back);
+        target_b = velocity_back;
+    }
+    // ================= [统一硬件输出] =================
+    intakeF.move_velocity(target_f);
+    intakeM.move_velocity(target_m);
+    intakeB.move_velocity(target_b);
+}
+
+
+// intake task
+void auto_intake_task_fn(void*) {
+    bool should_run = true;
+    while (true) {
+        if (pros::c::task_notify_take(true, 20)) {
+            should_run = !should_run;
+			is_preloading_active=false;
+        }
+        if (should_run) {
+		intaking(600, 200);
+        }
+    }
+}
+
+
+
+/**
+ * Runs initialization code. This occurs as soon as the program is started.
+ *
+ * All other competition modes are blocked by initialize; it is recommended
+ * to keep execution time for this mode under a few seconds.
+ */
+
+
+void initialize() {
+   
+
+	optical_top.set_integration_time(50);
+	optical_top.set_led_pwm(100);
+	pros::c::delay(100);
+	get_allience_color();
+	chassis.calibrate();
+	verticalEnc.set_position(0);
+	horizontalEnc.set_position(0);
+	//chassis original point
+	intakecoast();	
+	chassis.setPose(0,0,0);
+
+	pros::c::screen_erase();
+	pros::c::screen_set_pen(pros::c::COLOR_WHITE);
+
+	//print position
+	pros::Task screenTask{[&]() {
+		while(true){
+			if(!field_connection){	
+			controller.print(0, 0,"X: %.2f", chassis.getPose().x); // x
+			pros::delay(50);
+            controller.print(1,0, "Y: %.2f", chassis.getPose().y); // y
+			pros::delay(50);
+            controller.print(2,0, "DEG: %.2f", chassis.getPose().theta); // heading
+			pros::delay(50);
+			controller.print(2,18,"%s",color);
+			pros::c::screen_print(TEXT_LARGE, 1, "Battery: %.f percent",pros::battery::get_capacity());
+			pros::c::screen_print(TEXT_LARGE, 3, "Team Color: %s",color.c_str());
+
+			pros::delay(100);
+			}else{
+			controller.print(0, 0,"X: %.2f", chassis.getPose().x); // x
+			pros::delay(50);
+            controller.print(1,0, "Y: %.2f", chassis.getPose().y); // y
+			pros::delay(50);
+            controller.print(2,0, "DEG:%.2f", chassis.getPose().theta); // heading
+
+			pros::c::delay(50);
+			controller.print(2, 13, Autons[CurrentAuton]);
+
+			pros::c::screen_print(TEXT_LARGE, 1, "Battery: %.f percent",pros::battery::get_capacity());
+			pros::c::screen_print(TEXT_LARGE, 3, "Team Color: %s",color.c_str());			
+			pros::c::screen_print(TEXT_LARGE, 6, "Auton: %s", Autons[CurrentAuton]);
+
+
+
+			pros::delay(50);
+
+			if(!auton_started){
+				if(pros::c::screen_touch_status().touch_status == 1){
+					if(pros::c::screen_touch_status().x > 240){
+						AutonIncrease();
+					} else {
+						AutonDecrease();
+					}
+
+					while(pros::c::screen_touch_status().touch_status == 1){pros::c::delay(10);}
+				}
+			}
+
+
+
+			}			
+		}
+  	}};		
+	
+
+
+
+}
+
+
+
+
+/**
+ * Runs while the robot is in the disabled state of Field Management System or
+ * the VEX Competition Switch, following either autonomous or opcontrol. When
+ * the robot is enabled, this task will exit.
+ */
+void disabled() {
+}
+/**
+ * Runs after initialize(), and before autonomous when connected to the Field
+ * Management System or the VEX Competition Switch. This is intended for
+ * competition-specific initialization routines, such as an autonomous selector
+ * on the LCD.
+ *
+ * This task will exit when the robot is enabled and autonomous or opcontrol
+ * starts.
+ */
+void competition_initialize() { 
+	field_connection = true;
+
+}
+
+
+
+
+
+
+
+void auto_intaking(int velo_front,int velo_mid,int velo_back){
+	intakeF.move_velocity(velo_front);
+	intakeM.move_velocity(velo_mid);
+	intakeB.move_velocity(velo_back);
+}
+
+
+
+//////////////Autons/////////////////////////////////////////
+void Left7_hook(){
+	chassis.setPose(0,0,0);
+	pros::task_t auto_intake_task = pros::c::task_create(auto_intake_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+	 								TASK_STACK_DEPTH_DEFAULT, "automatic intake task");
+	
+	hook.set_value(true);	
+	chassis.moveToPoint(-7, 23, 900, {.forwards = true, .maxSpeed = 80, .minSpeed=40,.earlyExitRange = 1});
+	pros::delay(400);
+	loader.set_value(true);
+
+	chassis.turnToPoint(-35, 0,300, {.maxSpeed=80,.minSpeed = 30,.earlyExitRange = 15});
+	chassis.moveToPose(-31, -6,170, 1000, { .lead=0.1,.minSpeed = 100, .earlyExitRange = 1});
+
+
+	chassis.waitUntilDone();
+	chassis.moveToPose(-32, -30,180, 700, { .lead=0,.maxSpeed = 65,.minSpeed=60});
+
+
+
+	chassis.waitUntilDone();
+
+	chassis.moveToPose(-32, 20,-182, 600, {.forwards = false,.lead=0,.minSpeed=120});
+	chassis.moveToPoint(-32, 30, 500, {.forwards = false,.maxSpeed = 30});
+	pros::c::task_delete(auto_intake_task);
+	pros::delay(200); 
+	loader.set_value(false);	
+	highscore.set_value(true);
+	auto_intaking(400,600,200);
+	chassis.waitUntilDone();
+	pros::c::delay(900);
+	chassis.setPose(0,0,chassis.getPose().theta+180);	
+
+
+
+	//hook
+	chassis.turnToHeading(-80, 400,{.minSpeed=120});
+	chassis.moveToPoint(-9, 5, 80,{.minSpeed=60});
+	chassis.turnToHeading(-10, 400,{.minSpeed=40});
+	hook.set_value(false);
+	chassis.waitUntilDone();
+	chassis.moveToPose(-8, -18,3, 600,{.forwards=false,.lead=0.2,.maxSpeed=70,.minSpeed=70});
+
+	chassis.waitUntilDone();
+	pros::c::delay(200);
+	chassis.turnToHeading(30, 300,{.maxSpeed=50});
+	chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+	Odom.set_value(true);
+	pros::c::delay(9000);
+	
+}
+
+void Right7_hook(){
+	chassis.setPose(0,0,0);
+	hook.set_value(true);
+	pros::task_t auto_intake_task = pros::c::task_create(auto_intake_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+	 								TASK_STACK_DEPTH_DEFAULT, "automatic intake task");
+	chassis.moveToPose(7, 22,20 , 800, {.lead=0,.maxSpeed = 80, .minSpeed=70,.earlyExitRange = 2});
+	pros::delay(400);
+	loader.set_value(true);
+	chassis.waitUntil(22);
+	chassis.cancelAllMotions();
+	chassis.turnToPoint(35, 0,300, {.minSpeed = 100});
+	chassis.moveToPoint(33, -5, 900, { .maxSpeed = 90, .earlyExitRange = 5});
+
+	chassis.swingToHeading(180, DriveSide::RIGHT, 100,{.maxSpeed=80});
+	chassis.waitUntilDone();
+	chassis.arcade(60, 0);
+	pros::c::delay(700);
+
+	chassis.waitUntilDone();
+
+	chassis.moveToPose(33, 20,182, 600, {.forwards = false,.lead=0});
+	chassis.moveToPoint(33, 25, 500, {.forwards = false,.maxSpeed = 65});
+	pros::c::task_delete(auto_intake_task);
+	pros::delay(200); 
+	loader.set_value(false);	
+	highscore.set_value(true);
+	auto_intaking(400,600,200);
+	chassis.waitUntilDone();
+	pros::c::delay(400);
+	chassis.setPose(0,0,chassis.getPose().theta-180);	
+	pros::delay(500);
+
+	//hook
+	chassis.turnToHeading(-80, 400,{.minSpeed=120});
+	chassis.moveToPoint(-9, 5, 80,{.minSpeed=60});
+	chassis.turnToHeading(-7, 400,{.minSpeed=40});
+	hook.set_value(false);
+	chassis.waitUntilDone();
+	chassis.moveToPose(-8, -18,3, 700,{.forwards=false,.lead=0.2,.maxSpeed=80,.minSpeed=70});
+
+	chassis.waitUntilDone();
+	pros::c::delay(200);
+	chassis.turnToHeading(30, 300,{.maxSpeed=50});
+	chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+	Odom.set_value(true);
+	pros::c::delay(9000);
+	
+}
+
+
+void Left4_3_hook(){
+	chassis.setPose(0,0,0);
+	chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);
+	pros::task_t auto_intake_task = pros::c::task_create(auto_intake_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+	 								TASK_STACK_DEPTH_DEFAULT, "automatic intake task");
+	hook.set_value(true);
+	auto_intaking(600, 150, 200);
+	chassis.moveToPose(-1.5,-25,0,900,{.forwards = false,.lead=0.2,.maxSpeed=90,.minSpeed=80,.earlyExitRange = 5});
+	
+	pros::c::delay(200);
+	loader.set_value(true);		
+
+	chassis.turnToHeading(88,400);
+
+	//loading
+
+	chassis.moveToPose(24,-29,87,1250,{.lead = 0.1,.maxSpeed = 40,.minSpeed=40});
+	chassis.waitUntilDone();
+	
+	//score long goal
+	chassis.moveToPose(-23, -31,87, 600, {.forwards = false,.lead=0.1});
+	chassis.moveToPoint(-23, -31, 500, {.forwards = false,.maxSpeed = 60});
+	pros::c::task_delete(auto_intake_task);
+	pros::delay(200);
+
+	highscore.set_value(true);
+	auto_intaking(400,200,200);
+	chassis.waitUntilDone();
+	loader.set_value(false);
+	pros::delay( 900);
+
+
+
+	//mid goal
+	auto_intaking(600,150,0);
+	chassis.turnToHeading(-10,650);
+	chassis.waitUntilDone();
+	highscore.set_value(false);
+	chassis.moveToPoint(-24,-5,900,{.maxSpeed = 70,.minSpeed = 40});
+	pros::c::delay(500);
+	loader.set_value(true);
+	chassis.waitUntilDone();
+	chassis.turnToHeading(134, 900,{.direction = AngularDirection::CW_CLOCKWISE});
+
+	//chassis.moveToPoint(-40,5, 800,{.forwards=false,.maxSpeed = 60,.minSpeed = 55,.earlyExitRange = 1});
+	chassis.moveToPose(-40,8,134, 800,{.forwards=false,.maxSpeed = 60,.minSpeed = 55,.earlyExitRange = 1});	
+	pros::c::delay(600);
+	highscore.set_value(true);
+	auto_intaking(600,150,-100);
+	pros::delay(900);
+	loader.set_value(false); 
+	auto_intaking(600,-200,100);
+
+
+
+	//hook
+	chassis.moveToPose(-21,-20,88, 1200,{.lead=0,.maxSpeed = 90,.minSpeed = 70,.earlyExitRange = 1});	
+	chassis.waitUntilDone();
+	auto_intaking(0,0,0);
+	highscore.set_value(false);
+	hook.set_value(false);
+	chassis.moveToPoint(-35,-20,500,{.forwards=false,.maxSpeed = 70,.minSpeed = 60});
+	chassis.waitUntilDone();
+	chassis.swingToHeading(120,DriveSide::LEFT, 500,{.maxSpeed=50});
+	Odom.set_value(true);
+
+}
+
+void Right4_3_hook(){
+
+	chassis.setPose(0,0,0);
+	chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);
+	hook.set_value(true);	
+	pros::task_t auto_intake_task = pros::c::task_create(auto_intake_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+	 								TASK_STACK_DEPTH_DEFAULT, "automatic intake task");
+	
+	chassis.moveToPose(1.5,-26,0,900,{.forwards = false,.lead=0.2,.maxSpeed=90,.minSpeed=80,.earlyExitRange = 5});
+	
+	pros::c::delay(200);
+	loader.set_value(true);		
+
+	
+
+	chassis.turnToHeading(-88,400);
+
+	//loading
+
+	//chassis.moveToPose(-24,-29.5,-87,1250,{.lead = 0.1,.maxSpeed = 40,.minSpeed=40});
+	chassis.moveToPose(-10.5,-29.5,-87,1100,{.lead = 0,.maxSpeed = 60,.minSpeed=55});
+	chassis.waitUntilDone();
+
+	chassis.moveToPose(23, -31,-87, 600, {.forwards = false,.lead=0.1});
+	chassis.moveToPoint(23, -31, 500, {.forwards = false,.maxSpeed = 60});
+
+	//score long goal
+	pros::delay(300);
+	pros::c::task_delete(auto_intake_task);
+	highscore.set_value(true);
+	auto_intaking(400,200,200);
+	chassis.waitUntilDone();
+	loader.set_value(false);
+	pros::delay(500);
+
+
+	//mid goal
+	auto_intaking(600,-200,0);
+	chassis.turnToHeading(10,700);
+	chassis.waitUntilDone();
+	highscore.set_value(false);
+	chassis.moveToPoint(24,-10.7,800,{.maxSpeed = 70,.minSpeed = 30});
+	pros::c::delay(300);
+	loader.set_value(true);
+	chassis.waitUntilDone();
+
+	chassis.moveToPose(41,9,45, 800,{.lead=0.2,.maxSpeed = 60,.minSpeed = 30,.earlyExitRange = 2});
+	pros::c::delay(100);
+	loader.set_value(false);
+	pros::c::delay(500);
+	intakelift.set_value(true);
+	auto_intaking(-350, -200, 0);	
+	chassis.waitUntilDone();
+
+	pros::c::delay(800);
+
+	//hook
+	chassis.moveToPose(23,-17, 93, 1100,{.forwards=false,.lead=0,.maxSpeed = 90,.minSpeed = 40,.earlyExitRange = 5});	
+	pros::c::delay(300);
+	intakelift.set_value(false);
+	auto_intaking(0, 0, 0);	
+	chassis.waitUntilDone();
+
+	hook.set_value(false);
+	chassis.moveToPoint(32,-20,900,{.maxSpeed = 70,.minSpeed = 40});
+	chassis.waitUntilDone();
+	chassis.swingToHeading(45,DriveSide::LEFT, 300);
+	Odom.set_value(true);
+
+
+}	
+
+void Solo5_3_6(){
+	chassis.setPose(2.5,15.666,0);
+	chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);
+	hook.set_value(true);
+	// creat intake task
+	pros::task_t auto_intake_task = 
+	pros::c::task_create(auto_intake_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+						TASK_STACK_DEPTH_DEFAULT, "automatic intake task");
+
+
+	chassis.moveToPoint(2.5,21,700,{.maxSpeed = 70});
+	chassis.waitUntilDone();
+	chassis.moveToPose(3,-29,0,1000,{.forwards = false,.lead=0,.maxSpeed=100,.minSpeed=80,.earlyExitRange = 5});
+	chassis.moveToPose(3,-29,0,500,{.forwards = false,.lead=0,.maxSpeed=40,.earlyExitRange = 0.5});
+	pros::c::delay(200);
+	loader.set_value(true);	
+	chassis.waitUntilDone();
+	
+
+	chassis.turnToHeading(-88,400);
+
+	//loading
+
+
+	chassis.moveToPose(-10.5,-29.5,-87,1000,{.lead = 0,.maxSpeed = 60,.minSpeed=60});
+	chassis.waitUntilDone();
+
+	//score long goal
+
+	chassis.moveToPose(23, -31,-87, 600, {.forwards = false,.lead=0.1});
+	chassis.moveToPoint(23, -31, 400, {.forwards = false,.maxSpeed = 55});
+
+	pros::delay(200);
+	highscore.set_value(true);
+	pros::c::task_notify(auto_intake_task); // pause task
+	auto_intaking(400,200,200);
+	chassis.waitUntilDone();
+	loader.set_value(false);
+	pros::delay(500);
+
+	//mid goal
+	auto_intaking(600,-200,200);
+	chassis.turnToHeading(10,700);
+	chassis.waitUntilDone();
+	highscore.set_value(false);
+	chassis.moveToPoint(24,-10.7,900,{.maxSpeed = 70,.minSpeed = 30});
+	pros::c::delay(300);
+	loader.set_value(true);
+	chassis.waitUntilDone();
+
+	chassis.moveToPose(41,9,45, 700,{.lead=0.2,.maxSpeed = 60,.minSpeed = 30,.earlyExitRange = 5});
+	pros::c::delay(100);
+	loader.set_value(false);
+	pros::c::delay(500);
+	intakelift.set_value(true);
+
+	auto_intaking(-300, -200, 0);	
+	chassis.waitUntilDone();
+	chassis.arcade(20, 0);
+	pros::c::delay(300);
+	chassis.arcade(0, 0);
+	pros::c::delay(500);
+
+
+
+
+	chassis.setPose(0,0,chassis.getPose().theta-270);
+	chassis.arcade(-60, 10);
+	pros::c::delay(270);
+	chassis.turnToPoint(26,11, 400);	
+	
+
+
+	//go to load 2
+
+
+intakelift.set_value(false);
+	chassis.moveToPoint(26, 11,  1000,{.maxSpeed=80,.minSpeed=60,.earlyExitRange=4});
+	
+	pros::c::task_notify(auto_intake_task); // resume task
+	
+	chassis.swingToHeading(-320, DriveSide::LEFT, 200);
+
+	loader.set_value(true);
+	chassis.moveToPoint(55, 30,  900,{.maxSpeed=80,.minSpeed=70,.earlyExitRange=5});
+
+	
+	// //load 2
+	
+	chassis.moveToPose(54, 52, -360, 1100,{.lead=0,.maxSpeed=60,.minSpeed=50,.earlyExitRange=0.1});
+	chassis.waitUntilDone();
+	chassis.arcade(60,0);
+	
+	pros::delay(500);
+	chassis.arcade(0,0);
+	chassis.setPose(5,-35,chassis.getPose().theta+447);
+	pros::delay(100);
+	//score	
+	chassis.moveToPose(-23, -37.5,89, 600, {.forwards = false,.lead=0.1});
+	chassis.moveToPoint(-23, -37.5, 400, {.forwards = false,.maxSpeed = 80});
+
+	pros::delay(200);
+	
+	highscore.set_value(true);
+	
+
+	//pros::c::task_delete(auto_intake_task);
+	pros::c::task_notify(auto_intake_task); // pause intake
+	highscore.set_value(true);
+	auto_intaking(400,200,200);
+	chassis.waitUntilDone();
+	Odom.set_value(true);
+	loader.set_value(false);
+	pros::c::delay(1200);
+	highscore.set_value(false);
+
+	//7tugugjug*/
+
+
+}
+
+
+/////////////////////////////////////////////
+
+/**
+ * Runs the user autonomous code. This function will be started in its own task
+ * with the default priority and stack size whenever the robot is enabled via
+ * the Field Management System or the VEX Competition Switch in the autonomous
+ * mode. Alternatively, this function may be called in initialize or opcontrol
+ * for non-competition testing purposes.
+ *
+ * If the robot is disabled or communications is lost, the autonomous task
+ * will be stopped. Re-enabling the robot will restart the task, not re-start it
+ * from where it left off. 
+ */
+
+void autonomous() {
+
+
+	auton_started=true;	
+	//chassis.arcade(60,0);
+	//pros::delay(500);
+	Solo5_3_6();
+   /* switch (CurrentAuton) {
+        case 0:
+		Solo5_3_6();
+            break;
+        case 1:
+		Left4_3_hook();
+            break;
+        case 2:
+		Right4_3_hook();
+            break;
+        case 3:
+		Left7_hook();
+            break;
+        case 4:
+		Right7_hook();
+            break;
+    }
+
+*/
+}
+
+
+
+
+
+float DTkp = 0.85;//0.85
+bool highscore_con=false;
+bool intake_lift_con=false;
+bool hook_con=false;
+bool loader_con=false;
+bool odom_con=false;
+
+
+std::atomic<bool> auto_align_running{false};  // 任务运行状态
+pros::Task *auto_align_task_handle = nullptr;  // 用于管理任务
+
+void auto_align_task(){
+	auto_align_running=true; 
+	chassis.setPose(0,0,0); 
+	chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);
+	chassis.turnToHeading(-90, 400,{.minSpeed=120});
+	chassis.moveToPoint(-10, 3, 50,{.maxSpeed=75});
+	chassis.turnToHeading(-5,400,{.minSpeed=30,.earlyExitRange=0});
+	chassis.waitUntilDone();
+    auto_align_running = false;
+	chassis.setBrakeMode(MOTOR_BRAKE_COAST);	
+
+}
+ 
+void opcontrol() {
+
+	chassis.setBrakeMode(MOTOR_BRAKE_COAST);
+    intakecoast();
+	hook_con=true;
+
+//Drivetrain & Intake Controll  
+pros::Task DrivetrainTask{[&]() {
+
+	while (true) {
+		if(!auto_align_running){
+		int leftY = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
+		int rightX = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
+		intakelift.set_value(intake_lift_con);		
+		chassis.arcade(leftY, rightX*DTkp);				
+		}
+		Odom.set_value(odom_con);
+
+		loader.set_value(loader_con);
+		hook.set_value(hook_con); 
+
+
+
+
+		//loader
+    if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) 
+        loader_con = !loader_con;
+    
+	//hook
+    if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y))
+        hook_con = !hook_con;
+
+
+	if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
+         if (auto_align_running) {
+            auto_align_task_handle->remove();
+			auto_align_running = false;
+			chassis.setBrakeMode(MOTOR_BRAKE_COAST);
+         } else {
+            hook_con = false;
+            if (auto_align_task_handle) {
+                delete auto_align_task_handle;
+            }
+            auto_align_task_handle = new pros::Task(auto_align_task);
+        }
+    }
+
+	if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_R1)) {
+		if (auto_align_running) {
+			// 正在运行 → 停止任务（仅停止，不启动）
+			auto_align_task_handle->remove();
+			auto_align_running = false;
+			chassis.setBrakeMode(MOTOR_BRAKE_COAST);
+		}
+
+	}
+
+
+
+        pros::delay(10);
+	}
+}};
+
+
+pros::Task IntakeTask{[&]() {
+
+	while (true) {
+		if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {//intake
+ 
+			intaking(600, 200);
+			hook_con=true;
+			highscore.set_value(false);
+			intake_lift_con=false;
+			odom_con=true;
+		} else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)) {//reverse
+
+
+			while(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)==1)	{
+				intaking_reverse(-400, -150);}			
+			
+		} else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1) ) {//long goal
+			highscore.set_value(true);
+			low_complete=false;
+			while(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1)==1)	{
+			highscoring(600,180,200);			
+			}			
+
+		} else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)) {//mid high
+			hook_con=true;
+			low_complete=false;
+			while(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)==1)	{
+				midscoring(600, -150);}			
+		} 
+		
+		else {
+			is_preloading_active = false;
+			reverse_complete=false;
+			mid_complete=false;
+			optical_top.set_led_pwm(0); 
+
+			intakeF.move_velocity(0); 
+			intakeM.move_velocity(0);
+			intakeB.move_velocity(0);
+
+		}
+
+        pros::delay(20);
+	}
+
+}};
+
+
+
+
+
+
+
+}
