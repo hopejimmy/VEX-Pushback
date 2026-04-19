@@ -1,0 +1,1336 @@
+#include "main.h"
+#include "lemlib/chassis/chassis.hpp"
+#include "pros/abstract_motor.hpp"
+#include "pros/misc.h"
+#include "pros/misc.hpp"
+#include "pros/motors.h"
+#include "pros/rtos.h"
+#include "pros/rtos.hpp"
+#include "lemlib/api.hpp"
+#include "pros/screen.h"
+#include "lemlib/timer.hpp"
+#include "robot-config.h"
+#include <cmath>
+#include "cmath"
+#include <atomic>
+#include "DisBaseMovement.h"
+#include "path_generator.cpp"
+
+bool comp_mode=false;
+bool auton_started=false;
+int CurrentAuton = 0;
+
+//set number of autons
+const int NumberOfAutons = 2;//!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+//define auton names
+const char* Autons[] = {
+    "Skill 100pts         "
+};
+
+
+
+
+void AutonIncrease(){
+    CurrentAuton ++;
+    if(CurrentAuton > (NumberOfAutons-1)){
+        CurrentAuton = 0;
+    }
+}
+
+void AutonDecrease(){
+    CurrentAuton --;
+    if(CurrentAuton < 0){
+        CurrentAuton = NumberOfAutons - 1;
+    }
+}
+
+
+
+
+void intakecoast(){
+	intakeF.set_brake_mode(pros::MotorBrake::coast);
+	intakeM.set_brake_mode(pros::MotorBrake::brake);
+	intakeB.set_brake_mode(pros::MotorBrake::brake);
+}
+ 
+// 结构体
+struct Point {
+    int front_dis;    // 前方距离
+    int right_dis;    // 右侧距离  
+    int left_dis;     // 左侧距离
+};
+
+/**
+ * 获取多次采样滤波后的距离数据
+ * @param SAMPLE_COUNT 采样次数（默认5）
+ * @param SAMPLE_DELAY 采样间隔(ms)（默认50）
+ * @return Point 各方向距离，若某方向从未有效且本次无效则返回-1
+ */
+Point get_distance_Pose(int SAMPLE_COUNT = 5, int SAMPLE_DELAY = 50) {
+    // 为每个方向保存上次滤波值和初始化状态（跨调用保持）
+    static struct {
+        float last_val;
+        bool initialized;
+    } front_state = { -1.0f, false },
+      right_state = { -1.0f, false },
+      left_state  = { -1.0f, false };
+
+    const float ALPHA = 0.3f;               // 滤波系数
+    const float INVALID_MIN = 0.0f;          // 无效值下限
+    const float INVALID_MAX = 2000.0f;       // 根据传感器量程调整
+
+    // 辅助函数：对指定传感器进行多次采样，返回有效平均值和是否有效
+    auto sample_average = [&](pros::Distance &sensor) -> std::pair<float, bool> {
+        long sum = 0;
+        int count = 0;
+        for (int i = 0; i < SAMPLE_COUNT; i++) {
+            int val = sensor.get_distance();
+            if (val > INVALID_MIN && val < INVALID_MAX) {
+                sum += val;
+                count++;
+            }
+            pros::delay(SAMPLE_DELAY);  // 采样间隔
+        }
+        if (count > 0) {
+            return { (float)sum / count, true };
+        } else {
+            return { -1.0f, false };    // 全部无效，标记为无效
+        }
+    };
+
+    // 获取三个方向的采样平均值及有效标志
+    auto [front_avg, front_valid] = sample_average(distanceFront);
+    auto [right_avg, right_valid] = sample_average(distanceRight);
+    auto [left_avg,  left_valid]   = sample_average(distanceLeft);
+
+    // 滤波函数：输入平均值和有效标志，更新状态，返回滤波值（可能为-1）
+    auto filter = [&](float avg, bool valid, auto& state) -> float {
+        if (!valid) {
+            // 本次采样全部无效：若已初始化则返回上次值，否则返回-1
+            return state.initialized ? state.last_val : -1.0f;
+        }
+        // 有效值处理
+        if (!state.initialized) {
+            state.last_val = avg;        // 首次有效直接赋值
+            state.initialized = true;
+            return avg;
+        }
+        // 一阶低通滤波
+        state.last_val = ALPHA * avg + (1.0f - ALPHA) * state.last_val;
+        return state.last_val;
+    };
+
+    Point p;
+    p.front_dis = static_cast<int>(filter(front_avg, front_valid, front_state));
+    p.right_dis = static_cast<int>(filter(right_avg, right_valid, right_state));
+    p.left_dis  = static_cast<int>(filter(left_avg, left_valid, left_state));
+    return p;
+}
+
+
+
+
+
+
+
+
+
+
+
+float deccelarate=1;
+bool reverse_complete=false;
+bool low_complete=false;
+bool mid_complete=false;
+static int upper_ball_counter = 0;
+static int mid_ball_counter = 0;
+
+
+bool is_intake_jammed() {
+    return (intakeM.get_current_draw() >= 2300);
+}
+
+bool is_intakeF_jammed() {
+    return (intakeF.get_current_draw() >= 2500);
+}
+
+bool is_ball_preload(){
+    return (dis_preload.get_distance() <= 100);
+
+}
+
+
+
+bool is_ball_ready(bool counter=true) {
+if(counter){
+    // 判断当前是否检测到球
+    if (optical_top.get_proximity() >= 200) {
+        // 检测到球，增加计数
+        upper_ball_counter++;
+ 
+        // 达到稳定次数后一直返回true
+        if (upper_ball_counter >= 10) {
+            return true;
+        }
+    } else {
+        // 没检测到球，计数设为0
+        if (upper_ball_counter > 0) {
+            upper_ball_counter = 0;
+        }
+    }
+    return false;
+	} else {
+		return (optical_top.get_proximity() >= 200);
+	}
+}
+
+bool is_mid_full(float dis) {
+
+    // 判断当前是否检测到球
+    if (dis_roller.get_distance() <= dis) {
+        // 检测到球，增加计数
+        mid_ball_counter++;
+ 
+        // 达到稳定次数后一直返回true
+        if (mid_ball_counter >= 30) {
+            return true;
+        }
+    } else {
+        // 没检测到球，计数设为0
+        if (mid_ball_counter > 0) {
+            mid_ball_counter = 0;
+        }
+    }
+    return false;
+	
+}
+
+
+
+
+//Driver intake functions
+void intaking(int velocity_front, int velocity_back, float back_dec=0.1){
+intakeF.move_velocity(velocity_front);
+    if(is_ball_ready()){
+			optical_top.set_led_pwm(0);
+        if(!is_intake_jammed()){
+			if (is_mid_full(50)) {
+			// intakeF.move_velocity(velocity_front);
+            intakeM.move_velocity(0);
+            intakeB.move_velocity(0);		
+			}else{
+            // intakeF.move_velocity(velocity_front);
+            intakeM.move_velocity(velocity_back);
+            intakeB.move_velocity(0);
+			}
+         } else {
+            // intakeF.move_velocity(velocity_front);
+            intakeM.move_velocity(-velocity_back);
+            intakeB.move_velocity(0);
+        }
+    } else {
+			optical_top.set_led_pwm(100);
+        if(!is_intake_jammed()){
+            // intakeF.move_velocity(velocity_front);
+            intakeM.move_velocity(velocity_back);
+            intakeB.move_velocity(velocity_back*back_dec);
+        } else {
+            // intakeF.move_velocity(velocity_front);
+            intakeM.move_velocity(-velocity_back);
+            intakeB.move_velocity(velocity_back*back_dec);
+        }
+    }
+}
+
+void intaking_reverse(int velocity_front, int velocity_back){
+
+	while(!low_complete){
+			intakeF.move_velocity(velocity_front*2);
+			intakeM.move_velocity(velocity_back);
+			intakeB.move_velocity(-velocity_back);
+			pros::delay(300);
+			low_complete=true;
+		}
+	    if(!is_intake_jammed()){
+			intakeF.move_velocity(velocity_front);
+			intakeM.move_velocity(velocity_back);
+			intakeB.move_velocity(-velocity_back*0.2);
+        } else {
+			intakeF.move_velocity(velocity_front);
+			intakeM.move_velocity(-velocity_back);
+			intakeB.move_velocity(velocity_back*0.2);
+        }
+
+
+}
+
+
+lemlib::Timer highscore_timer(500);
+void highscoring(int velocity_front, int velocity_mid, int velocity_back){
+
+	if(is_ball_preload()){
+			highscore_timer.reset();
+			while(is_ball_preload()&&!highscore_timer.isDone()){
+			intakeF.move_velocity(-200);
+			intakeM.move_velocity(-velocity_mid*0.5 *deccelarate);
+			intakeB.move_velocity(velocity_back*deccelarate);
+			}
+	
+	}
+	else{
+
+	}
+ 
+		if(!(is_intake_jammed()&&is_intakeF_jammed())){
+			intakeF.move_velocity(velocity_front);
+			intakeM.move_velocity(velocity_mid*deccelarate);
+			intakeB.move_velocity(velocity_back*deccelarate);
+		} else {
+			intakeF.move_velocity(velocity_front);
+			intakeM.move_velocity(velocity_mid*deccelarate);
+			intakeB.move_velocity(velocity_back*deccelarate);
+		}
+
+}
+
+void midscoring(int velocity_front, int velocity_back){ 
+	optical_preload.set_led_pwm(100);
+	optical_top.set_led_pwm(100);
+	if(is_ball_ready(false)&&!reverse_complete){
+		while(!reverse_complete){
+				intakeF.move_velocity(-300);
+				intakeM.move_velocity(-100);
+				intakeB.move_velocity(velocity_back*2);
+				pros::delay(200);
+				reverse_complete=true;
+			}
+
+	}
+	if((optical_preload.get_hue() >= 190 && optical_preload.get_hue() <= 235 && dis_preload.get_distance() <= 120) ||mid_complete){
+
+			intakeF.move_velocity(velocity_front);
+			intakeM.move_velocity(-100);//-100
+			intakeB.move_velocity(10); 
+			mid_complete=true;
+
+	} else {
+
+		if(!is_intakeF_jammed()){
+			intakeF.move_velocity(velocity_front);
+			intakeM.move_velocity(70);
+			intakeB.move_velocity(velocity_back);
+			
+		} else {
+			intakeF.move_velocity(-velocity_front);
+			intakeM.move_velocity(70);
+			intakeB.move_velocity(velocity_back);
+			pros::c::delay(50);
+		}
+
+	}
+
+}
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////
+
+
+
+
+
+
+// intake task
+void auto_intake_task_fn(void*) {
+    bool should_run = true;
+    while (true) {
+        if (pros::c::task_notify_take(true, 20)) {
+            should_run = !should_run;
+        }
+        if (should_run) {
+		intaking(600, 200);
+        }
+    }
+}
+
+void auto_intake2_task_fn(void*) {
+    bool should_run = true;
+    while (true) {
+        if (pros::c::task_notify_take(true, 20)) {
+            should_run = !should_run;
+        }
+        if (should_run) {
+		intaking(600, 100,1);
+        }
+    }
+}
+
+// intake task
+void auto_highscore_task_fn(void*) {
+    bool should_run = true;
+    while (true) {
+        if (pros::c::task_notify_take(true, 20)) {
+            should_run = !should_run;
+        }
+        if (should_run) {
+		highscoring(600,200,200);
+        }
+    }
+}
+
+// intake task
+void auto_midscore_task_fn(void*) {
+    bool should_run = true;
+    while (true) {
+        if (pros::c::task_notify_take(true, 20)) {
+            should_run = !should_run;
+        }
+        if (should_run) {
+		midscoring(400, -50);
+        }
+    }
+}
+
+
+/**
+ * Runs initialization code. This occurs as soon as the program is started.
+ *
+ * All other competition modes are blocked by initialize; it is recommended
+ * to keep execution time for this mode under a few seconds.
+ */
+
+
+void initialize() {
+
+    chassis.calibrate(); 
+
+	verticalEnc.set_position(0);
+	horizontalEnc.set_position(0);
+
+	chassis.setPose(0,0,0);
+	intakecoast();
+	//print position
+	
+/*
+	pros::Task screenTask_regular{[&]() {
+	while(true){
+		if(!comp_mode){	
+			controller.print(0, 0,"X: %.3f", chassis.getPose().x); // x
+			pros::delay(50);
+            controller.print(1,0, "Y: %.3f", chassis.getPose().y); // y
+			pros::delay(50);
+            controller.print(2,0, "DEG: %.2f", chassis.getPose().theta); // heading
+			pros::c::screen_print(TEXT_LARGE, 4, "DEG: %.2f", chassis.getPose().theta);
+			pros::delay(50);
+            controller.print(0,12, "BAT:%.f%%",pros::battery::get_capacity());
+			pros::c::screen_print(TEXT_LARGE, 1, "Battery: %.f percent",pros::battery::get_capacity());
+			pros::delay(150);
+		}else{
+            controller.print(0,0, "DEG: %.2f", chassis.getPose().theta); // heading
+			pros::c::screen_print(TEXT_LARGE, 1, "DEG: %.2f", chassis.getPose().theta);
+			pros::c::delay(50);
+			controller.print(0,12, "BAT:%.f%%",pros::battery::get_capacity());
+			pros::c::screen_print(TEXT_LARGE, 5, "Auton: %s", Autons[CurrentAuton]);	
+			pros::delay(50);
+			if(!auton_started){
+				if(pros::c::screen_touch_status().touch_status == 1){
+					if(pros::c::screen_touch_status().x > 240){
+						AutonIncrease();
+					} else {
+						AutonDecrease();
+					}
+
+					while(pros::c::screen_touch_status().touch_status == 1){pros::c::delay(10);}
+				}
+			}
+
+		}
+	}
+  	}};				
+	
+*/
+
+//print position & auto select
+	controller.print(0, 0,"X: %.3f", chassis.getPose().x); // x
+	pros::delay(50);
+    controller.print(1,0, "Y: %.3f", chassis.getPose().y); // y
+	pros::delay(50);
+    controller.print(2,0, "Theta: %.3f", chassis.getPose().theta); // heading
+	pros::delay(50);
+	controller.print(0, 18, "Dis:%d",distanceFront.get_distance());
+	pros::Task screenTask1{[&]() {
+		while(true){
+ 
+			controller.clear();
+			pros::lcd::print(1,"Battery: %.0f%%", pros::battery::get_capacity());
+			pros::delay(50);			
+			pros::lcd::print(2, Autons[CurrentAuton]);
+			pros::delay(50);
+			// pros::lcd::print(3, teamcolor[team]);	
+			// pros::delay(50);
+			controller.print(0, 0,"X: %.3f", chassis.getPose().x); // x
+			pros::delay(50);
+            controller.print(1,0, "Y: %.3f", chassis.getPose().y); // y
+			pros::delay(50);
+            controller.print(2,0, "Theta: %.3f", chassis.getPose().theta); // heading
+			pros::delay(50);
+			controller.print(0, 15, "Dis:%d",distanceFront.get_distance());
+			pros::delay(100);
+		}
+  	}};
+
+}
+
+/**
+ * Runs while the robot is in the disabled state of Field Management System or
+ * the VEX Competition Switch, following either autonomous or opcontrol. When
+ * the robot is enabled, this task will exit.
+ */
+void disabled() {
+}
+/**
+ * Runs after initialize(), and before autonomous when connected to the Field
+ * Management System or the VEX Competition Switch. This is intended for
+ * competition-specific initialization routines, such as an autonomous selector
+ * on the LCD.
+ *
+ * This task will exit when the robot is enabled and autonomous or opcontrol
+ * starts.
+ */
+void competition_initialize() {
+
+intakelift.set_value(true);
+comp_mode=true;
+
+}
+
+
+
+
+
+float parking_cycle=0;
+bool parking_direction=false;
+
+bool dis_reach_target(int dis){
+	return(distanceFront.get_distance()<=dis);
+}
+
+void simple_intaking(int velo_front,int velo_mid,int velo_back){
+	intakeF.move_velocity(velo_front);
+	intakeM.move_velocity(velo_mid);
+	intakeB.move_velocity(velo_back);
+}
+
+
+
+
+//////////////Autons/////////////////////////////////////////
+
+
+float front_dis;
+float left_dis;
+float right_dis;
+float privious_X;
+float current_theta;
+lemlib::Timer mid_timer(2500);
+lemlib::Timer high_timer(800);
+
+
+
+void auto_intaking(int velo_front,int velo_mid,int velo_back){
+	intakeF.move_velocity(velo_front);
+	intakeM.move_velocity(velo_mid);
+	intakeB.move_velocity(velo_back);
+}
+
+
+void minor_adjustment(int velocity, int timeout)
+{
+
+	chassis.arcade(velocity, 0);
+	pros::c::delay(timeout);
+	chassis.arcade(0, 0);
+}
+
+
+void skills100pts() {
+	chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);	
+	chassis.setPose(0,0,90);//theta 90	
+	hook.set_value(true);
+	intakelift.set_value(false);
+	// creat task
+	pros::task_t auto_intake_task = 
+	pros::c::task_create(auto_intake_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+											TASK_STACK_DEPTH_DEFAULT, "automatic intake task");
+	pros::task_t auto_highscore_task = 
+	pros::c::task_create(auto_highscore_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+											TASK_STACK_DEPTH_DEFAULT, "automatic highscore task");
+	pros::task_t auto_midscore_task = 
+	pros::c::task_create(auto_midscore_task_fn, NULL, TASK_PRIORITY_DEFAULT,
+											TASK_STACK_DEPTH_DEFAULT, "automatic midscore task");
+
+	pros::c::task_notify(auto_highscore_task); // pause task
+	pros::c::task_notify(auto_midscore_task); // pause task
+
+	//move to center goal
+	chassis.moveToPose(23,2,75, 1500,{.lead=0.2,.maxSpeed=100,.minSpeed=50,.earlyExitRange=1});
+	chassis.waitUntilDone();
+
+	pros::c::delay(300);
+	chassis.turnToHeading(-60, 600);
+	chassis.waitUntilDone();
+	pros::c::task_notify(auto_intake_task); // puase task
+	simple_intaking(0,0,0);
+	chassis.moveToPoint(33,-4,800,{.forwards=false,.maxSpeed=60,.earlyExitRange=2});
+	chassis.waitUntilDone();
+	chassis.swingToHeading(-42, DriveSide::LEFT, 200,{.maxSpeed=50});
+	
+	chassis.waitUntilDone();
+
+	//score center goal
+	highscore.set_value(true);
+	simple_intaking(400,200,-150);
+	chassis.arcade(-50,0);
+	pros::c::delay(200);
+	chassis.arcade(0, 0);
+
+
+	chassis.setPose(0,0,chassis.getPose().theta);
+	pros::delay(500);
+	simple_intaking(0,0,0);
+
+
+	//reset position
+
+	chassis.moveToPoint(-32, 30, 800,{.maxSpeed=90,.minSpeed=90,.earlyExitRange=2});//17,7
+	pros::c::delay(500);
+	simple_intaking(600,200,200);
+	chassis.moveToPoint(-32, 30, 800,{.maxSpeed=70,.minSpeed=20,.earlyExitRange=0.5});
+	loader.set_value(true);	
+	chassis.waitUntilDone();
+
+	pros::c::delay(100);
+	chassis.turnToHeading(0, 500);
+
+
+	pros::c::task_notify(auto_intake_task); // resume task
+	highscore.set_value(false);
+	chassis.waitUntilDone();
+	while(!dis_reach_target(510)){
+	chassis.arcade(20, 0);}
+	left_dis=distanceLeft.get_distance();//mm
+	chassis.arcade(0, 0);
+	pros::c::delay(100);
+	chassis.turnToHeading(-91, 500);
+	chassis.waitUntilDone();
+	privious_X=(860-left_dis)/25.4;
+	chassis.setPose(-33+privious_X,-32,chassis.getPose().theta+181);//+180
+	pros::c::delay(100);
+
+	//load 1
+	chassis.moveToPoint(5,-31.5,800,{.maxSpeed = 45,.minSpeed=45 });
+	chassis.waitUntilDone();
+	chassis.arcade(-30,0);
+	pros::delay(100);	
+	chassis.arcade(30,0);	
+	pros::delay(1400);
+
+
+	
+	//go to other side to score
+	chassis.arcade(-60, 0);
+	pros::c::delay(200);
+	chassis.turnToHeading(210,300, {.maxSpeed=100,.minSpeed = 80, .earlyExitRange = 2});
+	loader.set_value(false);
+	chassis.moveToPoint(-35, -45,500, {.minSpeed = 80, .earlyExitRange = 3});
+
+	pros::c::task_notify(auto_intake_task); // pause task
+	simple_intaking(0,0,0);
+
+
+	chassis.moveToPoint(-92, -47,  500, {.maxSpeed=120,.minSpeed = 100, .earlyExitRange = 2});
+	chassis.waitUntilDone();
+
+	tankmove_distanceToWall(850,800,100, 100);
+	
+	//chassis.setPose(0,0,270);//theta 270	
+	chassis.resetLocalPosition();
+
+
+
+
+	chassis.turnToHeading(180, 1000,{.maxSpeed=70});
+	chassis.waitUntilDone();
+
+	//chassis.moveToPose(9, 14, 270,1000,{.forwards=false,.lead=0.4,.maxSpeed=90,.minSpeed=40,.earlyExitRange=2});
+	//chassis.waitUntilDone();
+	minor_adjustment(-50,300);
+
+	chassis.turnToHeading(270,1000);
+	chassis.waitUntilDone();
+	
+	hook.set_value(false);
+	minor_adjustment(-50,800);
+	highscore.set_value(true);
+	reverse_complete=false;
+	pros::c::task_notify(auto_highscore_task); // resume task
+
+	
+	//chassis.arcade(-30, 0);
+	loader.set_value(true);
+	pros::c::delay(500);
+	chassis.arcade(0,0);
+	
+	pros::c::delay(500);
+	chassis.setPose(0,0,chassis.getPose().theta-270);
+	
+	pros::delay(500);
+	pros::c::task_notify(auto_highscore_task); // pause task
+
+
+	//load 2
+	
+	pros::c::task_notify(auto_intake_task); // resume task
+	chassis.moveToPose(0.5,35,0.5,500,{.lead = 0.1,.maxSpeed = 80,.minSpeed=80});
+
+	chassis.moveToPose(0.5,42,0.5,500,{.lead = 0.1,.maxSpeed = 40,.minSpeed=40});
+	highscore.set_value(false);	
+	chassis.waitUntilDone();
+	chassis.arcade(-30,0);
+	pros::delay(100);	
+	chassis.arcade(45,0);	
+	pros::delay(1400);
+
+	//score 2
+	hook.set_value(false);
+	chassis.moveToPose(0, -5, 1, 900, {.forwards=false,.lead=0,.maxSpeed=75,.minSpeed = 40, .earlyExitRange = 0.3});
+	minor_adjustment(-75, 300);
+	chassis.waitUntilDone();
+	pros::c::task_notify(auto_intake_task); // pause task
+	highscore.set_value(true);
+
+
+	reverse_complete=false;
+	pros::c::task_notify(auto_highscore_task); // resume task
+
+	loader.set_value(false);
+	chassis.waitUntilDone();
+	pros::c::delay(200);
+	chassis.arcade(-25,0);
+	pros::delay(500);
+	chassis.arcade(0,0);
+	pros::c::delay(100);
+	if(fabs(chassis.getPose().theta)>2){
+	chassis.setPose(0,0,chassis.getPose().theta);	
+	} 
+	else{
+	chassis.setPose(0,0,0);	
+	}
+	pros::delay(1000);
+	chassis.waitUntilDone();
+	pros::c::task_notify(auto_highscore_task); // pause task
+
+	simple_intaking(0,200,200);
+	
+
+
+	//score low goal
+
+	chassis.turnToHeading(95,800);
+
+	chassis.moveToPoint(19.16,-2.3, 700,{.maxSpeed=60,.minSpeed=40});
+	simple_intaking(600,0,0);
+	chassis.waitUntilDone();
+	loader.set_value(true);
+	pros::delay(500);
+
+	chassis.moveToPose(35.3, -19, 132,1000,{.lead=0,.maxSpeed=60,.minSpeed=50});
+	pros::delay(200);
+	loader.set_value(false);
+	chassis.waitUntilDone();
+	intakelift.set_value(true);
+	pros::delay(50);
+	simple_intaking(-300,-200,-10);
+	/*
+	pros::c::delay(1500);
+	chassis.arcade(-60, 5);
+	pros::c::delay(300);
+
+
+
+		
+	//clear opposite parking zone
+	
+	chassis.moveToPose(18 ,33,80, 1800,{.forwards=false,.lead=0.1,.maxSpeed=80,.earlyExitRange=2});
+	pros::c::delay(200);
+	highscore.set_value(false);
+	intakelift.set_value(false);
+	pros::c::task_notify(auto_intake_task); // resume task
+	chassis.waitUntilDone();
+
+	chassis.moveToPoint(28, 35,500,{.maxSpeed=70,.minSpeed=60,.earlyExitRange=2});
+	chassis.waitUntilDone();
+	pros::c::delay(200);
+	Odom.set_value(true);
+	chassis.tank(65, 65);
+	pros::c::delay(200);
+	chassis.tank(55, 57);
+	parking_cycle=0;
+	parking_direction=false;
+	while(!parking_direction){
+	if((dis_reach_target(1700))&&((distanceFront.get_distance()!=9999))){
+        parking_cycle++;
+        // 达到稳定次数后一直返回true
+        if (parking_cycle >= 5) {
+            parking_direction=true;
+		// loader.set_value(true);	
+        }
+		pros::c::delay(20);
+    } 
+	}
+
+	chassis.turnToHeading(88, 200,{.maxSpeed=30});
+	pros::c::delay(200);
+	// loader.set_value(false);
+	chassis.tank(56, 58);
+	
+	pros::c::delay(700);
+
+
+
+	while(!dis_reach_target(1300)){
+	chassis.tank(50, 55);}
+
+	chassis.tank(33, 35);
+
+
+	while(!dis_reach_target(780) ){
+	chassis.tank(30, 33 );}
+	chassis.tank(0, 0);
+	Odom.set_value(false);
+
+bool anal_finished=false;
+while(!anal_finished){
+	if(chassis.getPose().theta>90){
+		chassis.swingToHeading(90, DriveSide::RIGHT, 500,{.minSpeed=30,.earlyExitRange=0.1});
+		anal_finished=true;
+
+	}
+	else{
+		chassis.swingToHeading(90, DriveSide::LEFT, 500,{.minSpeed=30,.earlyExitRange=0.1});
+		anal_finished=true;
+
+	}
+}
+
+
+
+	chassis.waitUntilDone();
+
+	pros::c::delay(100);
+
+
+	//reset position
+
+	float current_theta = chassis.getPose().theta;
+	Point distance = get_distance_Pose();//5,50
+	left_dis = distance.left_dis;    // mm
+	front_dis = distance.front_dis;  // mm
+
+	pros::c::task_notify(auto_intake_task); //pause task
+	simple_intaking(0, 0, 0);
+	pros::c::delay(300);
+	chassis.setPose(
+  		(left_dis - 27) / 25.4,
+		(750 - front_dis) / 25.4,
+  		current_theta - 90);
+
+
+
+	//go to center upper
+	chassis.swingToHeading(-30, DriveSide::RIGHT, 400,{.minSpeed=60});
+	chassis.moveToPoint(30, -30, 1500,{.forwards=false,.maxSpeed=100,.minSpeed=50,.earlyExitRange=4});
+	chassis.waitUntilDone();
+	chassis.turnToHeading(-5, 300);
+	chassis.moveToPose(35.5,-21,-15, 700,{.lead=0.1,.maxSpeed=80,.minSpeed=50,.earlyExitRange=3});
+	simple_intaking(600,0,0);	
+	chassis.waitUntilDone();
+	pros::c::delay(100);
+	chassis.turnToHeading(-60, 400);
+	simple_intaking(0,0,0);	
+	chassis.waitUntilDone();
+	pros::c::delay(100);
+	chassis.moveToPoint(50,-25,900,{.forwards=false,.maxSpeed=60,.minSpeed=30,.earlyExitRange=0.1});
+	chassis.swingToHeading(-45, DriveSide::LEFT, 400,{.minSpeed=30});
+	chassis.waitUntilDone();
+
+
+	
+	//score center upper
+
+	chassis.arcade(-20,0);
+	highscore.set_value(true);
+	reverse_complete=false;
+	pros::c::task_notify(auto_midscore_task);
+
+
+	pros::delay(500);
+	chassis.arcade(0, 0);
+
+	pros::delay(1500);
+	pros::c::task_delete(auto_midscore_task);
+	simple_intaking(200,100,-50);
+	chassis.setPose(0,0,chassis.getPose().theta);
+	pros::delay(500);
+
+	simple_intaking(0,0,0);
+	chassis.arcade(30, 0);
+	pros::c::delay(200);
+	chassis.arcade(-20, 0);
+	pros::c::delay(500);
+
+
+
+	//reset position
+
+	chassis.moveToPoint(-34, 30, 800,{.maxSpeed=90,.minSpeed=90,.earlyExitRange=2});//17,7
+	pros::c::delay(500);
+	if (is_mid_full(40)) {
+	simple_intaking(600,200,200);	
+	}else {
+	highscore.set_value(false);
+	simple_intaking(0,0,0);
+	}
+
+	chassis.moveToPoint(-34, 30, 700,{.maxSpeed=70,.minSpeed=20,.earlyExitRange=0.5});
+	loader.set_value(true);	
+	chassis.waitUntilDone();
+
+	pros::c::delay(100);
+	chassis.turnToHeading(0, 400);//-70
+
+
+
+
+
+	pros::c::task_notify(auto_intake_task); // resume task
+	highscore.set_value(false);
+	chassis.waitUntilDone();
+	while(!dis_reach_target(500)){
+	chassis.arcade(20, 0);}
+	left_dis=distanceLeft.get_distance();//mm
+	chassis.arcade(0, 0);
+	pros::c::delay(100);
+	chassis.turnToHeading(-90, 600);
+	chassis.waitUntilDone();
+	privious_X=(860-left_dis)/25.4;
+	chassis.setPose(-33+privious_X,-32,chassis.getPose().theta+182);//+180
+	pros::c::delay(100);
+
+
+
+	//load 3
+	chassis.moveToPoint(5,-31,800,{.maxSpeed =50,.minSpeed=40 });
+	chassis.waitUntilDone();
+	chassis.arcade(-30,0);
+	pros::delay(100);	
+	chassis.arcade(80,0);	
+	pros::delay(300);
+	chassis.arcade(-30,0);
+	pros::delay(100);	
+	chassis.arcade(45,0);	
+	pros::delay(1000);
+
+
+	
+	//go to other side to score
+	chassis.arcade(-60, 0);
+	pros::c::delay(200);
+	chassis.turnToHeading(210,300, {.maxSpeed=100,.minSpeed = 80, .earlyExitRange = 2});
+	loader.set_value(false);
+	chassis.moveToPoint(-35, -45,500, {.minSpeed = 80, .earlyExitRange = 3});
+
+	pros::c::task_notify(auto_intake_task); // pause task
+	simple_intaking(0,0,0);
+	
+
+
+	chassis.moveToPoint(-92, -47,  500, {.maxSpeed=120,.minSpeed = 100, .earlyExitRange = 2});
+	chassis.waitUntilDone();
+
+	tankmove_distanceToWall(850, 400,100, 100);
+	chassis.resetLocalPosition();
+
+
+
+
+	chassis.turnToHeading(250, 300,{.maxSpeed=70});
+	chassis.moveToPose(7, 14, 270,1200,{.forwards=false,.lead=0.1,.maxSpeed=90,.minSpeed=40,.earlyExitRange=2});
+	chassis.waitUntilDone();
+	
+	highscore.set_value(true);
+
+
+	reverse_complete=false;
+	pros::c::task_notify(auto_highscore_task); // resume task
+
+	chassis.waitUntilDone();
+	
+	chassis.arcade(-30, 0);
+	loader.set_value(true);
+	pros::c::delay(500);
+	chassis.arcade(0,0);
+	
+	pros::c::delay(500);
+	chassis.setPose(0,0,0);
+	
+	pros::delay(500);
+	pros::c::task_notify(auto_highscore_task); // pause task	
+
+	//load 4
+	
+	pros::c::task_notify(auto_intake_task); // resume task
+	chassis.moveToPose(1,35,0.5,500,{.lead = 0.1,.maxSpeed = 80,.minSpeed=80});
+
+	chassis.moveToPose(1,42,0.5,500,{.lead = 0.1,.maxSpeed = 40,.minSpeed=40});
+	highscore.set_value(false);	
+	chassis.waitUntilDone();
+	chassis.arcade(-30,0);
+	pros::delay(100);	
+	chassis.arcade(45,0);	
+	pros::delay(1400);
+
+	//score 4
+	chassis.moveToPose(0, -5, 1, 900, {.forwards=false,.lead=0,.maxSpeed=75,.minSpeed = 40, .earlyExitRange = 0.3});
+	chassis.waitUntilDone();
+	pros::c::task_notify(auto_intake_task); // pause task
+	highscore.set_value(true);
+
+
+	reverse_complete=false;
+	pros::c::task_notify(auto_highscore_task); // resume task
+
+
+	loader.set_value(false);
+	chassis.waitUntilDone();
+	pros::c::delay(200);
+	chassis.arcade(-25,0);
+	pros::delay(500);
+	chassis.arcade(0,0);
+	pros::c::delay(100);
+	if(fabs(chassis.getPose().theta)>3){
+	chassis.setPose(0,0,chassis.getPose().theta);	
+	} 
+	else{
+	chassis.setPose(0,0,0);	
+	}
+	pros::c::delay(1000);
+	chassis.waitUntilDone();
+	pros::c::task_notify(auto_highscore_task); // pause task
+	simple_intaking(0,0,0);
+
+
+	// parking
+	chassis.moveToPose(20,33,80, 1500,{.lead=0.2,.maxSpeed=70,.earlyExitRange=2});
+	chassis.waitUntilDone();
+	simple_intaking(-600,200,200);
+	chassis.moveToPoint(28, 36,1000,{.maxSpeed=70,.minSpeed=60});
+	chassis.waitUntilDone();
+
+	Odom.set_value(true);
+	chassis.tank(60, 65);
+	pros::c::delay(200);
+	chassis.tank(63, 65);	
+	parking_cycle=0;
+	parking_direction=false;
+	while(!parking_direction){
+		if((dis_reach_target(1800))&&((distanceFront.get_distance()!=9999))){
+			parking_cycle++;
+			// 达到稳定次数后一直返回true
+			if (parking_cycle >= 5) {
+				parking_direction=true;
+			}
+			pros::c::delay(20);
+		} 
+	}
+
+	chassis.tank(0, 0);
+	pros::c::delay(5000);
+*/
+//dfsdfsdfsdfsd*/
+}
+ 
+/////////////////////////////////////////////
+
+
+
+/**
+ * Runs the user autonomous code. This function will be started in its own task
+ * with the default priority and stack size whenever the robot is enabled via 
+ * the Field Management System or the VEX Competition Switch in the autonomous
+ * mode. Alternatively, this function may be called in initialize or opcontrol
+ * for non-competition testing purposes.
+ *
+ * If the robot is disabled or communications is lost, the autonomous task
+ * will be stopped. Re-enabling the robot will restart the task, not re-start it
+ * from where it left off.
+ */
+ 
+    std::vector<lemlib::Pose> myPath = {
+		{0, 0, 100},
+		// {1.75, 15, 80},
+		{2.219, 32.261, 0},
+		// {0, 41.651, 60},
+		{-6.762, 52.538, 0},
+		{-6.762, 60, 0}
+    };
+	std::vector<lemlib::Pose> mySmoothPath = PathGenerator::generate(myPath, 80.0);
+
+void test_path_generator() {
+	// 4 waypoints: {x inches, y inches, heading degrees}
+	// Draws a gentle S-curve across the field
+	// Adjust these coords to match your actual field setup
+	std::vector<lemlib::Pose> myPath = {
+		{0,   0,  90},   // start, facing right
+		{20,  20, 90},   // curve up-right
+		{0,   40, 90},   // curve back left
+		{20,  60, 90}    // end
+	};
+
+	std::vector<lemlib::Pose> smoothPath = PathGenerator::generate(myPath, 80.0);
+
+	for (int i = 0; i < (int)smoothPath.size(); i++) {
+		bool isLast = (i == (int)smoothPath.size() - 1);
+		chassis.moveToPose(
+			smoothPath[i].x,
+			smoothPath[i].y,
+			chassis.getPose().theta,
+			500,
+			{
+				.maxSpeed = smoothPath[i].theta,
+				.earlyExitRange = isLast ? 0.5f : 3.0f
+			}
+		);
+		if (isLast) chassis.waitUntilDone();
+	}
+}
+
+// PID turn test - set TEST_ANGLE to whichever angle you want to test
+#define TEST_ANGLE 90   // change to 45 or 90 (or any angle) to test
+
+void test_turn_pid() {
+	chassis.turnToHeading(TEST_ANGLE, 2000);
+	chassis.waitUntilDone();
+}
+
+void autonomous() {
+
+	auton_started=true;
+	//test_turn_pid();    // PID tuning - swap back to skills100pts() when done
+	skills100pts();  // original autonomous routine - uncomment to restore
+	// test_path_generator(); // temporary: testing PathGenerator, remove when done
+	//chassis.setPose(0,0,-90);
+	//chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);
+	//chassis.moveToPose(-23, -7.5, -150, 1500,{.lead=0.2,.maxSpeed=80,.minSpeed=30,.earlyExitRange=0.5});
+}
+
+
+
+
+
+
+float Drive_kp = 0.85;//0.85
+bool highscore_con=false;
+bool intake_lift_con=false;
+bool hook_con=false;
+bool loader_con=false;
+bool odom_con=false;
+
+
+std::atomic<bool> auto_align_running{false};  // 任务运行状态
+pros::Task *auto_align_task_handle = nullptr;  // 用于管理任务
+
+void auto_align_task(){
+	auto_align_running=true;
+	Odom.set_value(false);
+	chassis.setPose(0,0,0); 
+	chassis.setBrakeMode(MOTOR_BRAKE_BRAKE);
+	chassis.swingToPoint(47.3, 12, DriveSide::RIGHT, 600);
+	loader_con=false;
+	chassis.waitUntilDone();
+
+	chassis.moveToPose(47, 10,90, 1500,{.lead=0.1,.maxSpeed=90,.minSpeed=40,.earlyExitRange=2});
+	intakelift.set_value(true); //intake_lift_con=true;
+	chassis.waitUntilDone();
+
+	pros::c::delay(100);
+
+	chassis.turnToHeading(0, 500);
+	chassis.waitUntilDone();
+	pros::c::delay(100);
+	Odom.set_value(true);
+	while(!dis_reach_target(225)){chassis.tank(60, 60);}
+	intakelift.set_value(false); //intake_lift_con=false;
+
+	chassis.tank(0, 0);
+    auto_align_running = false;
+	chassis.setBrakeMode(MOTOR_BRAKE_COAST);	
+
+}
+
+
+void opcontrol() {
+
+intake_lift_con=true;
+	chassis.setBrakeMode(MOTOR_BRAKE_COAST);
+    intakecoast();
+	hook_con=true;
+
+//Drivetrain & Intake Controll  
+pros::Task DrivetrainTask{[&]() {
+
+	while (true) {
+		if(!auto_align_running){
+		int leftY = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
+		int rightX = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
+		intakelift.set_value(intake_lift_con);		
+		chassis.arcade(leftY, rightX*Drive_kp);				
+		}
+		Odom.set_value(odom_con);
+
+		loader.set_value(loader_con);
+		hook.set_value(hook_con); 
+
+
+
+
+		//loader
+    if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)||controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) 
+        loader_con = !loader_con;
+    
+//hook
+    if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y)) 
+        hook_con = !hook_con;
+    
+
+
+	if (hook_con==true) deccelarate=1; 
+	else 				deccelarate=0.5;
+
+
+	if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_RIGHT)) {
+         if (auto_align_running) {
+            auto_align_task_handle->remove();
+			auto_align_running = false;
+			chassis.setBrakeMode(MOTOR_BRAKE_COAST);
+         } else {
+            hook_con = false;
+            if (auto_align_task_handle) {
+                delete auto_align_task_handle;
+            }
+            auto_align_task_handle = new pros::Task(auto_align_task);
+        }
+    }
+        pros::delay(10);
+	}
+}};
+
+
+pros::Task IntakeTask{[&]() {
+
+	while (true) {
+		if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {//intake
+ 
+			intaking(600, 200);
+			hook_con=true;
+			highscore.set_value(false);
+			intake_lift_con=false;
+			odom_con=true;
+		} else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)) {//reverse
+
+			highscore.set_value(true);
+			intake_lift_con=true;
+
+			while(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)==1)	{
+				intaking_reverse(-170, -80);}			
+			
+		} else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1) ) {//long goal
+			highscore.set_value(true);
+			low_complete=false;
+			while(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1)==1)	{
+			highscoring(600,180,200);			
+			}			
+
+		} else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)) {//mid high
+			hook_con=true;
+			low_complete=false;
+			while(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)==1)	{
+				midscoring(400, -50);}			
+		} 
+		
+		else {
+			reverse_complete=false;
+			mid_complete=false;
+			optical_top.set_led_pwm(0); 
+			optical_preload.set_led_pwm(0);
+			intakeF.move_velocity(0); 
+			intakeM.move_velocity(0);
+			intakeB.move_velocity(0);
+
+		}
+
+        pros::delay(20);
+	}
+
+}};
+
+
+
+// //Pnumatics Control
+// pros::Task buttonTask{[&]() {
+// while(true){
+
+// //loader
+//     if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)||controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) 
+//         loader_con = !loader_con;
+    
+// //hook
+//     if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y)) 
+//         hook_con = !hook_con;
+    
+
+
+// 	if (hook_con==true) deccelarate=1; 
+// 	else 				deccelarate=0.5;
+
+
+// 	if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_RIGHT)) {
+//          if (auto_align_running) {
+//             auto_align_task_handle->remove();
+// 			auto_align_running = false;
+// 			chassis.setBrakeMode(MOTOR_BRAKE_COAST);
+//          } else {
+//             hook_con = false;
+//             if (auto_align_task_handle) {
+//                 delete auto_align_task_handle;
+//             }
+//             auto_align_task_handle = new pros::Task(auto_align_task);
+//         }
+//     }
+	
+// pros::delay(10);
+
+// }
+// }};
+
+
+
+
+
+}
