@@ -929,8 +929,8 @@ void autonomous() {
 	auton_started=true;	
 	//chassis.arcade(60,0);
 	//pros::delay(500);
-	Solo5_3_6();
-   /* switch (CurrentAuton) {
+	//Solo5_3_6();
+    switch (CurrentAuton) {
         case 0:
 		Solo5_3_6();
             break;
@@ -948,7 +948,7 @@ void autonomous() {
             break;
     }
 
-*/
+
 }
 
 
