@@ -7,26 +7,25 @@ pros::Controller controller(pros::E_CONTROLLER_MASTER);
 //front roller
 pros::Motor intakeF(6,pros::MotorGearset::blue);
 //indexer
-pros::Motor intakeM(-10,pros::MotorGearset::green);
+pros::Motor intakeM(-2,pros::MotorGearset::green);
 //back roller
-pros::Motor intakeB(20,pros::MotorGearset::green);
+pros::Motor intakeB(12,pros::MotorGearset::green);
 //drivetrain left
-pros::MotorGroup leftMotors({ -17, 18, -19},pros::MotorGearset::blue);
-// drivetrain right
-pros::MotorGroup rightMotors({ -8, 7, 9},pros::MotorGearset::blue);
+pros::MotorGroup leftMotors({-20, 18, -19},pros::MotorGearset::blue);
+pros::MotorGroup rightMotors({10, -8, 9}, pros::MotorGearset::blue);
 //odometry wheels
-pros::Rotation verticalEnc(-13);
+pros::Rotation verticalEnc(-5);
 pros::Rotation horizontalEnc(15);
 //pneumatics
-pros::ADIDigitalOut loader(8);    // Port D
-pros::ADIDigitalOut aligner(1);   // Port A
-pros::ADIDigitalOut odom(2);      // Port B
-pros::ADIDigitalOut descore(3);   // Port C
+pros::ADIDigitalOut loader(1);
+pros::ADIDigitalOut eliminate(7);
+pros::ADIDigitalOut wheelup(2);
+pros::ADIDigitalOut aligner(8);
 
-pros::Optical optical(12);
+pros::Optical optical(13);
+
 //imu
-pros::Imu imu(14);
-
+pros::Imu imu(7);
 //lemlib defs
 lemlib::TrackingWheel vertical(&verticalEnc, lemlib::Omniwheel::NEW_275, -0.059);
 lemlib::TrackingWheel horizontal(&horizontalEnc, 1.98, -1.93);
